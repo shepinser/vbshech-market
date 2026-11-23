@@ -1,0 +1,10 @@
+{% extends 'base.html' %}{% block title %}{{ 'Регистрация' if mode == 'register' else 'Вход' }} — ВБШЕЧ{% endblock %}{% block content %}
+<section class="auth-panel"><a class="back-link" href="{{ url_for('index') }}">На главную</a><h1>{{ 'Создать аккаунт' if mode == 'register' else 'Войти в ВБШЕЧ' }}</h1><p class="muted">{{ 'Сохраняйте товары в своей корзине.' if mode == 'register' else 'Рады видеть вас снова.' }}</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}">
+{% if mode == 'register' %}<label>Как к вам обращаться<input name="name" value="{{ request.form.get('name', '') }}" minlength="2" maxlength="80" autocomplete="name" required></label>{% endif %}
+<label>Email<input name="email" type="email" value="{{ request.form.get('email', '') }}" maxlength="254" autocomplete="email" required placeholder="you@example.ru"></label>
+<label>Пароль<input name="password" type="password" autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" {% if mode == 'register' %}minlength="8"{% endif %} maxlength="128" required></label>
+{% if mode == 'register' %}<small>Не менее 8 символов. Email сохраняется без проверки письмом.</small><label>Повторите пароль<input name="confirm" type="password" autocomplete="new-password" minlength="8" maxlength="128" required></label>{% endif %}
+<button class="primary">{{ 'Зарегистрироваться' if mode == 'register' else 'Войти' }}</button></form>
+<p class="auth-switch">{{ 'Уже есть аккаунт?' if mode == 'register' else 'Первый раз у нас?' }} <a href="{{ url_for('login') if mode == 'register' else url_for('register') }}">{{ 'Войти' if mode == 'register' else 'Зарегистрироваться' }}</a></p></section>
+{% endblock %}
