@@ -1,0 +1,40 @@
+{% extends 'base.html' %}
+{% from 'macros.html' import icon with context %}
+{% block content %}
+<div class="catalog-heading"><h1>Работа в ПВЗ</h1>{% if g.user.Роль == 'admin' %}<a class="secondary" href="{{ url_for('admin') }}">Управление магазином</a>{% endif %}</div>
+<section class="pvz-desk" aria-label="Выдача заказа">
+{% if issued %}
+  <div class="pvz-issued" role="status">
+    <div class="delivery-check"><svg viewBox="0 0 52 52" fill="none" aria-hidden="true"><circle class="delivery-check-ring" cx="26" cy="26" r="23"/><path class="delivery-check-mark" d="m15 26 8 8 15-16"/></svg></div>
+    <h2>{{ 'Возврат принят!' if issued.СтатусЗаказа == 'returned' else 'Заказ выдан!' }}</h2><p>{% if issued.СтатусЗаказа == 'returned' %}Заказ №{{ issued.Код }} возвращён. Остатки восстановлены.{% else %}Заказ №{{ issued.Код }} получил {{ issued.Имя }}{% endif %}</p>
+    <a class="primary" href="{{ url_for('staff') }}">{{ 'Следующий заказ' if issued.СтатусЗаказа == 'returned' else 'Выдать следующий заказ' }}</a>
+  </div>
+{% else %}
+  <div class="pvz-desk-heading">{{ icon('box') }}<h2>Выдача и возврат</h2><p>Введи код, который показал покупатель</p></div>
+  <form class="pvz-code-form" method="post" action="{{ url_for('find_pickup_order') }}">
+    <input type="hidden" name="csrf" value="{{ session.csrf }}">
+    <label for="pvz-code">Код покупателя</label><div class="pvz-code-entry"><input id="pvz-code" name="code" value="{{ lookup_code }}" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off" placeholder="000000" required data-pvz-code><button class="primary">Найти заказ</button></div>
+  </form>
+  {% if lookup_error %}<p class="pvz-lookup-error" role="alert">{{ lookup_error }}</p>{% endif %}
+  {% for order in found %}
+  <article class="pvz-found-order"><div class="section-heading"><h3>Заказ №{{ order.Код }}</h3><span class="status status-{{ order.СтатусЗаказа }}">{{ statuses[order.СтатусЗаказа] }}</span></div>
+    <p class="pvz-customer">{{ icon('user') }} {{ order.Имя }}</p><p class="pvz-found-address">{{ order.Город }}, {{ order.Адрес }}</p>
+    {% for item in order['items'] %}<div class="pvz-found-item">{% if item.image %}<img src="{{ item.image }}" alt="{{ item.НазваниеТовара }}">{% endif %}<div><strong>{{ item.НазваниеТовара }}</strong><p>{{ item.Параметры or '' }} · {{ item.Количество }} шт.</p></div><b>{{ (item.ЦенаЗаЕдиницу*item.Количество)|rub }}</b></div>{% endfor %}
+    <div class="pvz-found-total"><span>Итого</span><strong>{{ order.ОбщаяСумма|rub }}</strong></div>
+    <form data-pvz-issue method="post" action="{{ url_for('process_order', order_id=order.Код) }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="action" value="{{ 'return' if order.СтатусЗаказа == 'return_requested' else 'issue' }}"><input type="hidden" name="code" value="{{ lookup_code }}"><input type="hidden" name="desk" value="1"><button class="primary pvz-issue-button">{{ icon('check') }} {{ 'Принять возврат' if order.СтатусЗаказа == 'return_requested' else 'Выдать заказ' }} №{{ order.Код }}</button></form>
+    {% if order.СтатусЗаказа == 'ready' %}<details class="pickup-refusal"><summary>Покупатель отказывается от заказа</summary><p>Вернутся все товары заказа. Проверь комплект перед подтверждением.</p><form data-pvz-issue method="post" action="{{ url_for('process_order', order_id=order.Код) }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="action" value="refuse"><input type="hidden" name="code" value="{{ lookup_code }}"><input type="hidden" name="desk" value="1"><button class="secondary">Подтвердить отказ и вернуть товары</button></form></details>{% endif %}
+  </article>
+  {% endfor %}
+  {% if found or lookup_error %}<a class="text-link pvz-reset" href="{{ url_for('staff') }}">Ввести другой код</a>{% endif %}
+{% endif %}
+</section>
+
+<section class="pvz-order-list" data-orders-view data-live-refresh="{{ 'false' if lookup_mode else 'true' }}">
+  <div class="section-heading"><h2>Список заказов</h2><span class="muted">{{ orders|length }}</span></div>
+  <p class="scope-note muted">{{ 'Все пункты выдачи' if g.user.Роль == 'admin' else 'Заказы твоего пункта выдачи' }}</p>
+  <form class="staff-search" method="get" action="{{ url_for('staff') }}"><label>{{ icon('search') }}<input name="search" value="{{ search }}" placeholder="Номер заказа" inputmode="numeric" aria-label="Номер заказа"></label><button class="secondary">Найти</button></form>
+  <nav class="status-tabs"><a class="{{ 'active' if not status_filter }}" href="{{ url_for('staff', search=search) }}">Все</a>{% for key,label in statuses.items() %}<a class="{{ 'active' if status_filter == key }}" href="{{ url_for('staff', status=key, search=search) }}">{{ label }}</a>{% endfor %}</nav>
+  {% for order in orders %}<article class="pvz-list-row" data-order-id="{{ order.Код }}" data-order-status="{{ order.СтатусЗаказа }}"><div><h3>Заказ №{{ order.Код }}</h3><p>{{ order.Имя }} · {{ order.Город }}, {{ order.Адрес }}</p><small>{% for item in order['items'] %}{{ item.НазваниеТовара }} × {{ item.Количество }}{{ '; ' if not loop.last }}{% endfor %}</small></div><div class="pvz-list-summary"><span class="status status-{{ order.СтатусЗаказа }}">{{ statuses[order.СтатусЗаказа] }}</span><strong>{{ order.ОбщаяСумма|rub }}</strong></div></article>
+  {% else %}<p class="soft-notice">Заказов пока нет.</p>{% endfor %}
+</section>
+{% endblock %}

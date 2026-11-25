@@ -1,6 +1,7 @@
 """Каталог, покупки и управление магазином. Все данные хранятся в Access."""
 import hmac
 import secrets
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -8,13 +9,20 @@ from flask import abort, flash, g, jsonify, redirect, render_template, request, 
 from PIL import Image, ImageOps, UnidentifiedImageError
 import pyodbc
 from db import BASE_DIR, connection, records
-from catalog_data import categories, category_ids, enrich
+from catalog_data import categories, category_ids, enrich, search_items, search_key
 
-STATUSES = {'created': 'Оформлен', 'shipping': 'В пути', 'ready': 'Готов к выдаче', 'issued': 'Выдан', 'cancelled': 'Отменён'}
-ROLES = {'customer': 'Покупатель', 'staff': 'Сотрудник ПВЗ', 'admin': 'Администратор'}
+STATUSES = {'created': 'Оформлен', 'shipping': 'В пути', 'ready': 'Готов к выдаче', 'issued': 'Выдан', 'return_requested': 'Ожидает возврата', 'returned': 'Возвращён', 'cancelled': 'Отменён'}
+ROLES = {'customer': 'Покупатель', 'staff': 'Сотрудник ПВЗ', 'admin': 'Администратор', 'supplier': 'Поставщик'}
 
 class StockError(Exception):
     pass
+
+def restore_stock(cur, order_id):
+    # Вызывается только после успешного условного перехода статуса в той же транзакции.
+    items = records(cur.execute('SELECT КодВарианта, Количество FROM СоставЗаказов WHERE КодЗаказа=?', order_id))
+    for item in items:
+        if item['КодВарианта']:
+            cur.execute('UPDATE ВариантыТоваров SET Остаток=Остаток+? WHERE Код=?', item['Количество'], item['КодВарианта'])
 
 def back(default='index'):
     target = request.form.get('next', '')
@@ -43,39 +51,40 @@ def catalog():
         low, high = high, low
     with connection() as db:
         cats = categories(db)
-        # Внешний ключ Products.CategoryID соединяет товар с его подкатегорией.
-        sql = '''SELECT p.*, c.Title AS CategoryTitle FROM Products AS p
-                 INNER JOIN Categories AS c ON p.CategoryID=c.ID WHERE p.IsActive=True'''
+        # Внешний ключ Товары.КодКатегории соединяет товар с его подкатегорией.
+        sql = '''SELECT p.*, c.Название AS CategoryTitle FROM Товары AS p
+                 INNER JOIN Категории AS c ON p.КодКатегории=c.Код WHERE p.Активен=True'''
         params = []
         if q:
-            sql += ' AND (p.Title LIKE ? OR p.Brand LIKE ?)'
-            params += ['%' + q + '%'] * 2
+            found = [item['id'] for item in search_items(db) if search_key(q) in item['key']]
+            sql += ' AND p.Код IN (' + ','.join('?' for _ in found) + ')' if found else ' AND 1=0'
+            params += found
         if category:
             ids = category_ids(cats, category)
-            sql += ' AND p.CategoryID IN (' + ','.join('?' for _ in ids) + ')'
+            sql += ' AND p.КодКатегории IN (' + ','.join('?' for _ in ids) + ')'
             params += ids
         if low:
-            sql += ' AND p.Price>=?'
+            sql += ' AND p.Цена>=?'
             params.append(low)
         if high:
-            sql += ' AND p.Price<=?'
+            sql += ' AND p.Цена<=?'
             params.append(high)
         if color or size or request.args.get('in_stock'):
-            sql += ' AND p.ID IN (SELECT ProductID FROM ProductVariants WHERE Stock>0'
+            sql += ' AND p.Код IN (SELECT КодТовара FROM ВариантыТоваров WHERE Остаток>0'
             if color:
-                sql += ' AND ColorLabel=?'
+                sql += ' AND Цвет=?'
                 params.append(color)
             if size:
-                sql += ' AND SizeLabel=?'
+                sql += ' AND Размер=?'
                 params.append(size)
             sql += ')'
-        sql += {'cheap': ' ORDER BY p.Price ASC', 'expensive': ' ORDER BY p.Price DESC', 'new': ' ORDER BY p.ID DESC'}.get(sort, ' ORDER BY p.ID')
+        sql += {'cheap': ' ORDER BY p.Цена ASC', 'expensive': ' ORDER BY p.Цена DESC', 'new': ' ORDER BY p.Код DESC'}.get(sort, ' ORDER BY p.Код')
         products = enrich(db, records(db.cursor().execute(sql, params)))
-        colors = [r[0] for r in db.cursor().execute('SELECT DISTINCT ColorLabel FROM ProductVariants ORDER BY ColorLabel')]
-        sizes = [r[0] for r in db.cursor().execute("SELECT DISTINCT SizeLabel FROM ProductVariants WHERE SizeLabel<>'Без размера' ORDER BY SizeLabel")]
+        colors = [r[0] for r in db.cursor().execute('SELECT DISTINCT Цвет FROM ВариантыТоваров ORDER BY Цвет')]
+        sizes = [r[0] for r in db.cursor().execute("SELECT DISTINCT Размер FROM ВариантыТоваров WHERE Размер<>'Без размера' ORDER BY Размер")]
     if sort == 'rating':
         products.sort(key=lambda p: p['rating'] or 0, reverse=True)
-    selected = next((c for c in cats if c['ID'] == category), None)
+    selected = next((c for c in cats if c['Код'] == category), None)
     filtered = any([q, category, low, high, color, size, request.args.get('in_stock')])
     return render_template('index.html', products=products, categories=cats, q=q, category=category,
                            sort=sort, color=color, size=size, low=low, high=high, colors=colors,
@@ -83,24 +92,27 @@ def catalog():
 
 def cart_rows(db, user_id):
     # Access требует скобки для цепочки JOIN: корзина → товар → выбранный размер и цвет.
-    return records(db.cursor().execute('''SELECT ci.ID AS ItemID, ci.Quantity, ci.VariantID,
-        v.SizeLabel, v.ColorLabel, v.Stock, p.* FROM
-        (CartItems AS ci INNER JOIN Products AS p ON ci.ProductID=p.ID)
-        INNER JOIN ProductVariants AS v ON ci.VariantID=v.ID
-        WHERE ci.UserID=? ORDER BY ci.ID''', user_id))
+    return records(db.cursor().execute('''SELECT ci.Код AS ItemID, ci.Количество, ci.КодВарианта,
+        v.Размер, v.Цвет, v.Остаток, p.* FROM
+        (Корзина AS ci INNER JOIN Товары AS p ON ci.КодТовара=p.Код)
+        INNER JOIN ВариантыТоваров AS v ON ci.КодВарианта=v.Код
+        WHERE ci.КодПользователя=? ORDER BY ci.Код''', user_id))
 
 def event(cur, order_id, status):
-    cur.execute('INSERT INTO OrderEvents (OrderID, ActorID, EventStatus, CreatedAt) VALUES (?, ?, ?, ?)',
-                order_id, g.user['ID'], status, datetime.now())
+    cur.execute('INSERT INTO ИсторияЗаказов (КодЗаказа, КодСотрудника, СтатусСобытия, ДатаСоздания) VALUES (?, ?, ?, ?)',
+                order_id, g.user['Код'], status, datetime.now())
 
 def load_orders(db, condition, params):
-    result = records(db.cursor().execute('''SELECT o.*, p.City, p.Address, p.Hours, u.DisplayName
-        FROM (OrderHeaders AS o INNER JOIN PickupPoints AS p ON o.PickupID=p.ID)
-        INNER JOIN Users AS u ON o.UserID=u.ID WHERE ''' + condition + ' ORDER BY o.ID DESC', params))
+    result = records(db.cursor().execute('''SELECT o.*, p.Город, p.Адрес, p.ЧасыРаботы, u.Имя
+        FROM (Заказы AS o INNER JOIN ПунктыВыдачи AS p ON o.КодПунктаВыдачи=p.Код)
+        INNER JOIN Пользователи AS u ON o.КодПользователя=u.Код WHERE ''' + condition + ' ORDER BY o.Код DESC', params))
     for order in result:
-        order['items'] = records(db.cursor().execute('SELECT * FROM OrderItems WHERE OrderID=?', order['ID']))
-        order['events'] = records(db.cursor().execute('''SELECT e.*, u.DisplayName FROM OrderEvents AS e
-            INNER JOIN Users AS u ON e.ActorID=u.ID WHERE e.OrderID=? ORDER BY e.ID''', order['ID']))
+        order['delivery_elapsed'] = max(0, (datetime.now() - order['ДатаСоздания']).total_seconds())
+        # Полоса не доходит до конца, пока сервер не подтвердит поступление в ПВЗ.
+        order['delivery_progress'] = min(86, 6 + order['delivery_elapsed'] / 30 * 80)
+        order['items'] = records(db.cursor().execute('SELECT * FROM СоставЗаказов WHERE КодЗаказа=?', order['Код']))
+        order['events'] = records(db.cursor().execute('''SELECT e.*, u.Имя FROM ИсторияЗаказов AS e
+            LEFT JOIN Пользователи AS u ON e.КодСотрудника=u.Код WHERE e.КодЗаказа=? ORDER BY e.Код''', order['Код']))
     return result
 
 def save_uploads(files):
@@ -136,40 +148,59 @@ def register_routes(app, login_required, role_required):
     def shared():
         with connection() as db:
             cats = categories(db)
-            point_id = g.user.get('SelectedPickupID') if g.user else session.get('selected_pickup_id')
-            point = records(db.cursor().execute('SELECT * FROM PickupPoints WHERE ID=?', point_id)) if point_id else []
-            points = records(db.cursor().execute('SELECT * FROM PickupPoints ORDER BY City, Address'))
-        return {'statuses': STATUSES, 'roles': ROLES, 'nav_categories': cats, 'all_points': points,
-                'all_cities': sorted({p['City'] for p in points} | {'Ижевск', 'Москва', 'Санкт-Петербург', 'Казань', 'Самара', 'Екатеринбург'}),
+            point_id = g.user.get('ВыбранныйПунктВыдачи') if g.user else session.get('selected_pickup_id')
+            point = records(db.cursor().execute('SELECT * FROM ПунктыВыдачи WHERE Код=?', point_id)) if point_id else []
+            points = records(db.cursor().execute('SELECT * FROM ПунктыВыдачи ORDER BY Город, Адрес'))
+            search_index = search_items(db)
+        city = point[0]['Город'] if point else (g.user.get('ВыбранныйГород') if g.user else None) or session.get('selected_city', 'Ижевск')
+        return {'statuses': STATUSES, 'roles': ROLES, 'nav_categories': cats, 'all_points': points, 'search_index': search_index,
+                'city_has_points': any(p['Город'] == city for p in points),
+                'all_cities': sorted({p['Город'] for p in points} | {'Ижевск', 'Москва', 'Санкт-Петербург', 'Казань', 'Самара', 'Екатеринбург'}),
                 'selected_point': point[0] if point else None,
-                'selected_city': point[0]['City'] if point else (g.user.get('SelectedCity') if g.user else None) or session.get('selected_city', 'Ижевск')}
+                'selected_city': city}
+
+    @app.get('/api/notifications')
+    @login_required
+    def notifications():
+        with connection() as db:
+            rows = records(db.cursor().execute('''SELECT o.Код, p.Город, p.Адрес FROM Заказы AS o
+                INNER JOIN ПунктыВыдачи AS p ON o.КодПунктаВыдачи=p.Код
+                WHERE o.КодПользователя=? AND o.СтатусЗаказа='ready' ORDER BY o.Код DESC''', g.user['Код']))
+            condition, params = ('1=1', []) if request.args.get('scope') == 'staff' and g.user['Роль'] == 'admin' else (
+                ('КодПунктаВыдачи=?', [g.user['КодПунктаВыдачи'] or 0]) if g.user['Роль'] == 'staff'
+                and request.args.get('scope') == 'staff' else ('КодПользователя=?', [g.user['Код']]))
+            states = [{'id': r.Код, 'status': r.СтатусЗаказа} for r in db.cursor().execute(
+                'SELECT Код, СтатусЗаказа FROM Заказы WHERE ' + condition + ' ORDER BY Код DESC', params)]
+        return jsonify(user_id=g.user['Код'], states=states, notifications=[{
+            'id': r['Код'], 'message': f"Заказ №{r['Код']} готов к выдаче. {r['Город']}, {r['Адрес']}",
+            'url': url_for('orders')} for r in rows])
 
     @app.get('/api/suggestions')
     def suggestions():
         q = request.args.get('q', '').strip()[:80]
-        if len(q) < 2:
+        if not q:
             return jsonify([])
         with connection() as db:
-            rows = records(db.cursor().execute('SELECT TOP 6 ID, Title, Brand FROM Products WHERE IsActive=True AND (Title LIKE ? OR Brand LIKE ?) ORDER BY ID', '%' + q + '%', '%' + q + '%'))
-        return jsonify([{'title': r['Brand'] + ' / ' + r['Title'], 'url': url_for('product', product_id=r['ID'])} for r in rows])
+            matches = [item for item in search_items(db) if search_key(q) in item['key']][:6]
+        return jsonify([{'title': item['title'], 'url': item['url']} for item in matches])
 
     @app.get('/product/<int:product_id>')
     def product(product_id):
         with connection() as db:
-            rows = records(db.cursor().execute('SELECT * FROM Products WHERE ID=? AND IsActive=True', product_id))
+            rows = records(db.cursor().execute('SELECT * FROM Товары WHERE Код=? AND Активен=True', product_id))
             if not rows:
                 abort(404)
             p = enrich(db, rows)[0]
-            reviews = records(db.cursor().execute('''SELECT r.*, u.DisplayName FROM ProductReviews AS r
-                INNER JOIN Users AS u ON r.UserID=u.ID WHERE r.ProductID=? ORDER BY r.ID DESC''', product_id))
+            reviews = records(db.cursor().execute('''SELECT r.*, u.Имя FROM Отзывы AS r
+                INNER JOIN Пользователи AS u ON r.КодПользователя=u.Код WHERE r.КодТовара=? ORDER BY r.Код DESC''', product_id))
             can_review = False
             if g.user:
-                can_review = bool(db.cursor().execute('''SELECT TOP 1 i.ID FROM OrderItems AS i
-                    INNER JOIN OrderHeaders AS o ON i.OrderID=o.ID
-                    WHERE o.UserID=? AND i.ProductID=? AND o.OrderStatus='issued' ''', g.user['ID'], product_id).fetchone())
-            related = enrich(db, records(db.cursor().execute('SELECT TOP 4 * FROM Products WHERE CategoryID=? AND ID<>? AND IsActive=True ORDER BY ID', p['CategoryID'], product_id)))
+                can_review = bool(db.cursor().execute('''SELECT TOP 1 i.Код FROM СоставЗаказов AS i
+                    INNER JOIN Заказы AS o ON i.КодЗаказа=o.Код
+                    WHERE o.КодПользователя=? AND i.КодТовара=? AND o.СтатусЗаказа='issued' ''', g.user['Код'], product_id).fetchone())
+            related = enrich(db, records(db.cursor().execute('SELECT TOP 4 * FROM Товары WHERE КодКатегории=? AND Код<>? AND Активен=True ORDER BY Код', p['КодКатегории'], product_id)))
         variant_id = request.args.get('variant', type=int)
-        variant = next((v for v in p['variants'] if v['ID'] == variant_id), None) or next((v for v in p['variants'] if v['Stock'] > 0), p['variants'][0] if p['variants'] else None)
+        variant = next((v for v in p['variants'] if v['Код'] == variant_id), None) or next((v for v in p['variants'] if v['Остаток'] > 0), p['variants'][0] if p['variants'] else None)
         return render_template('product.html', p=p, variant=variant, reviews=reviews, can_review=can_review, related=related)
 
     @app.route('/favorites')
@@ -177,8 +208,8 @@ def register_routes(app, login_required, role_required):
     def favorites():
         with connection() as db:
             # Избранное связано одновременно с пользователем и товаром.
-            products = enrich(db, records(db.cursor().execute('''SELECT p.* FROM Products AS p
-                INNER JOIN Favorites AS f ON p.ID=f.ProductID WHERE f.UserID=? AND p.IsActive=True ORDER BY f.ID DESC''', g.user['ID'])))
+            products = enrich(db, records(db.cursor().execute('''SELECT p.* FROM Товары AS p
+                INNER JOIN Избранное AS f ON p.Код=f.КодТовара WHERE f.КодПользователя=? AND p.Активен=True ORDER BY f.Код DESC''', g.user['Код'])))
         return render_template('favorites.html', products=products)
 
     @app.post('/favorites/<int:product_id>')
@@ -186,13 +217,13 @@ def register_routes(app, login_required, role_required):
     def toggle_favorite(product_id):
         with connection() as db:
             cur = db.cursor()
-            if not cur.execute('SELECT ID FROM Products WHERE ID=? AND IsActive=True', product_id).fetchone():
+            if not cur.execute('SELECT Код FROM Товары WHERE Код=? AND Активен=True', product_id).fetchone():
                 abort(404)
-            item = cur.execute('SELECT ID FROM Favorites WHERE UserID=? AND ProductID=?', g.user['ID'], product_id).fetchone()
+            item = cur.execute('SELECT Код FROM Избранное WHERE КодПользователя=? AND КодТовара=?', g.user['Код'], product_id).fetchone()
             if item:
-                cur.execute('DELETE FROM Favorites WHERE ID=?', item.ID)
+                cur.execute('DELETE FROM Избранное WHERE Код=?', item.Код)
             else:
-                cur.execute('INSERT INTO Favorites (UserID, ProductID) VALUES (?, ?)', g.user['ID'], product_id)
+                cur.execute('INSERT INTO Избранное (КодПользователя, КодТовара) VALUES (?, ?)', g.user['Код'], product_id)
         return feedback('Удалено из избранного' if item else 'Добавлено в избранное', active=not bool(item))
 
     @app.post('/product/<int:product_id>/review')
@@ -205,15 +236,15 @@ def register_routes(app, login_required, role_required):
             return redirect(url_for('product', product_id=product_id) + '#reviews')
         with connection() as db:
             cur = db.cursor()
-            allowed = cur.execute('''SELECT TOP 1 i.ID FROM OrderItems AS i INNER JOIN OrderHeaders AS o ON i.OrderID=o.ID
-                WHERE o.UserID=? AND i.ProductID=? AND o.OrderStatus='issued' ''', g.user['ID'], product_id).fetchone()
+            allowed = cur.execute('''SELECT TOP 1 i.Код FROM СоставЗаказов AS i INNER JOIN Заказы AS o ON i.КодЗаказа=o.Код
+                WHERE o.КодПользователя=? AND i.КодТовара=? AND o.СтатусЗаказа='issued' ''', g.user['Код'], product_id).fetchone()
             if not allowed:
                 abort(403)
-            old = cur.execute('SELECT ID FROM ProductReviews WHERE UserID=? AND ProductID=?', g.user['ID'], product_id).fetchone()
+            old = cur.execute('SELECT Код FROM Отзывы WHERE КодПользователя=? AND КодТовара=?', g.user['Код'], product_id).fetchone()
             if old:
-                cur.execute('UPDATE ProductReviews SET Score=?, ReviewText=?, CreatedAt=? WHERE ID=?', score, text, datetime.now(), old.ID)
+                cur.execute('UPDATE Отзывы SET Оценка=?, ТекстОтзыва=?, ДатаСоздания=? WHERE Код=?', score, text, datetime.now(), old.Код)
             else:
-                cur.execute('INSERT INTO ProductReviews (UserID, ProductID, Score, ReviewText, CreatedAt) VALUES (?, ?, ?, ?, ?)', g.user['ID'], product_id, score, text, datetime.now())
+                cur.execute('INSERT INTO Отзывы (КодПользователя, КодТовара, Оценка, ТекстОтзыва, ДатаСоздания) VALUES (?, ?, ?, ?, ?)', g.user['Код'], product_id, score, text, datetime.now())
         flash('Спасибо! Ваш отзыв опубликован.')
         return redirect(url_for('product', product_id=product_id) + '#reviews')
 
@@ -226,33 +257,73 @@ def register_routes(app, login_required, role_required):
             abort(400)
         with connection() as db:
             cur = db.cursor()
-            if not cur.execute('SELECT ID FROM Products WHERE ID=? AND IsActive=True', product_id).fetchone():
+            if not cur.execute('SELECT Код FROM Товары WHERE Код=? AND Активен=True', product_id).fetchone():
                 abort(404)
-            variants = records(cur.execute('SELECT * FROM ProductVariants WHERE ProductID=? ORDER BY ID', product_id))
-            variant = next((v for v in variants if v['ID'] == variant_id), None) if variant_id else next((v for v in variants if v['Stock'] > 0), None)
-            if not variant or variant['Stock'] < quantity:
+            variants = records(cur.execute('SELECT * FROM ВариантыТоваров WHERE КодТовара=? ORDER BY Код', product_id))
+            variant = next((v for v in variants if v['Код'] == variant_id), None) if variant_id else next((v for v in variants if v['Остаток'] > 0), None)
+            if not variant or variant['Остаток'] < quantity:
                 return feedback('Выбранный вариант закончился. Выберите другой размер или цвет.', error=True)
-            item = cur.execute('SELECT ID, Quantity FROM CartItems WHERE UserID=? AND VariantID=?', g.user['ID'], variant['ID']).fetchone()
-            new_qty = quantity + (item.Quantity if item else 0)
-            if new_qty > min(99, variant['Stock']):
+            item = cur.execute('SELECT Код, Количество FROM Корзина WHERE КодПользователя=? AND КодВарианта=?', g.user['Код'], variant['Код']).fetchone()
+            new_qty = quantity + (item.Количество if item else 0)
+            if new_qty > min(99, variant['Остаток']):
                 return feedback('В корзине уже максимально доступное количество.', error=True)
             if item:
-                cur.execute('UPDATE CartItems SET Quantity=? WHERE ID=?', new_qty, item.ID)
+                cur.execute('UPDATE Корзина SET Количество=? WHERE Код=?', new_qty, item.Код)
             else:
-                cur.execute('INSERT INTO CartItems (UserID, ProductID, VariantID, Quantity) VALUES (?, ?, ?, ?)', g.user['ID'], product_id, variant['ID'], new_qty)
-            count = cur.execute('SELECT SUM(Quantity) FROM CartItems WHERE UserID=?', g.user['ID']).fetchone()[0]
-        return feedback('Товар добавлен в корзину', count=count)
+                cur.execute('INSERT INTO Корзина (КодПользователя, КодТовара, КодВарианта, Количество) VALUES (?, ?, ?, ?)', g.user['Код'], product_id, variant['Код'], new_qty)
+            count = cur.execute('SELECT SUM(Количество) FROM Корзина WHERE КодПользователя=?', g.user['Код']).fetchone()[0]
+        return feedback('Товар добавлен в корзину', count=count, variant_id=variant['Код'], quantity=new_qty,
+                        stock=variant['Остаток'])
+
+    @app.post('/cart/quantity/<int:variant_id>')
+    @login_required
+    def set_cart_quantity(variant_id):
+        """Кнопки на карточке задают количество выбранного размера и цвета."""
+        quantity = request.form.get('quantity', type=int)
+        if quantity is None or not 0 <= quantity <= 99:
+            abort(400)
+        with connection() as db:
+            cur = db.cursor()
+            variant = cur.execute('''SELECT v.КодТовара, v.Остаток, p.Активен, p.Цена FROM
+                ВариантыТоваров AS v INNER JOIN Товары AS p ON v.КодТовара=p.Код
+                WHERE v.Код=?''', variant_id).fetchone()
+            if not variant:
+                abort(404)
+            if quantity and (not variant.Активен or quantity > variant.Остаток):
+                return feedback('Такого количества сейчас нет в наличии.', error=True)
+            item = cur.execute('SELECT Код FROM Корзина WHERE КодПользователя=? AND КодВарианта=?',
+                               g.user['Код'], variant_id).fetchone()
+            if quantity == 0:
+                if item:
+                    cur.execute('DELETE FROM Корзина WHERE Код=?', item.Код)
+            elif item:
+                cur.execute('UPDATE Корзина SET Количество=? WHERE Код=?', quantity, item.Код)
+            else:
+                cur.execute('INSERT INTO Корзина (КодПользователя, КодТовара, КодВарианта, Количество) VALUES (?, ?, ?, ?)',
+                            g.user['Код'], variant.КодТовара, variant_id, quantity)
+            count = cur.execute('SELECT SUM(Количество) FROM Корзина WHERE КодПользователя=?', g.user['Код']).fetchone()[0] or 0
+            items = cart_rows(db, g.user['Код'])
+            total = sum(item['Цена'] * item['Количество'] for item in items)
+            can_checkout = all(item['Активен'] and item['Остаток'] >= item['Количество'] for item in items)
+        return feedback('Количество изменено' if quantity else 'Товар убран из корзины',
+                        count=count, variant_id=variant_id, quantity=quantity, stock=variant.Остаток,
+                        total=float(total), line_total=float(variant.Цена * quantity), can_checkout=can_checkout)
 
     @app.route('/cart')
     @login_required
     def cart():
         with connection() as db:
-            items = cart_rows(db, g.user['ID'])
+            items = cart_rows(db, g.user['Код'])
             enrich(db, items)
-            points = records(db.cursor().execute('SELECT * FROM PickupPoints ORDER BY City, Address'))
-        total = sum(item['Price'] * item['Quantity'] for item in items)
+            city = g.user.get('ВыбранныйГород') or session.get('selected_city', 'Ижевск')
+            if g.user.get('ВыбранныйПунктВыдачи'):
+                selected = db.cursor().execute('SELECT Город FROM ПунктыВыдачи WHERE Код=?', g.user['ВыбранныйПунктВыдачи']).fetchone()
+                if selected:
+                    city = selected.Город
+            points = records(db.cursor().execute('SELECT * FROM ПунктыВыдачи WHERE Город=? ORDER BY Адрес', city))
+        total = sum(item['Цена'] * item['Количество'] for item in items)
         session.setdefault('checkout_token', secrets.token_hex(24))
-        can_checkout = all(i['IsActive'] and i['Stock'] >= i['Quantity'] for i in items)
+        can_checkout = all(i['Активен'] and i['Остаток'] >= i['Количество'] for i in items)
         return render_template('cart.html', items=items, total=total, points=points, can_checkout=can_checkout)
 
     @app.post('/cart/change/<int:item_id>')
@@ -263,14 +334,14 @@ def register_routes(app, login_required, role_required):
             abort(400)
         with connection() as db:
             cur = db.cursor()
-            row = cur.execute('''SELECT c.ID, v.Stock FROM CartItems AS c INNER JOIN ProductVariants AS v ON c.VariantID=v.ID
-                WHERE c.ID=? AND c.UserID=?''', item_id, g.user['ID']).fetchone()
+            row = cur.execute('''SELECT c.Код, v.Остаток FROM Корзина AS c INNER JOIN ВариантыТоваров AS v ON c.КодВарианта=v.Код
+                WHERE c.Код=? AND c.КодПользователя=?''', item_id, g.user['Код']).fetchone()
             if not row:
                 abort(404)
             if quantity == 0:
-                cur.execute('DELETE FROM CartItems WHERE ID=?', item_id)
-            elif quantity <= row.Stock:
-                cur.execute('UPDATE CartItems SET Quantity=? WHERE ID=?', quantity, item_id)
+                cur.execute('DELETE FROM Корзина WHERE Код=?', item_id)
+            elif quantity <= row.Остаток:
+                cur.execute('UPDATE Корзина SET Количество=? WHERE Код=?', quantity, item_id)
             else:
                 flash('Такого количества сейчас нет в наличии.')
         return redirect(url_for('cart'))
@@ -278,8 +349,8 @@ def register_routes(app, login_required, role_required):
     @app.route('/pickup')
     def pickup():
         with connection() as db:
-            points = records(db.cursor().execute('SELECT * FROM PickupPoints ORDER BY City, Address'))
-        cities = sorted({p['City'] for p in points} | {'Ижевск', 'Москва', 'Санкт-Петербург', 'Казань', 'Самара', 'Екатеринбург'})
+            points = records(db.cursor().execute('SELECT * FROM ПунктыВыдачи ORDER BY Город, Адрес'))
+        cities = sorted({p['Город'] for p in points} | {'Ижевск', 'Москва', 'Санкт-Петербург', 'Казань', 'Самара', 'Екатеринбург'})
         return render_template('pickup.html', points=points, cities=cities)
 
     @app.post('/location')
@@ -288,14 +359,14 @@ def register_routes(app, login_required, role_required):
         city = request.form.get('city', '').strip()
         with connection() as db:
             if point_id:
-                found = db.cursor().execute('SELECT City FROM PickupPoints WHERE ID=?', point_id).fetchone()
+                found = db.cursor().execute('SELECT Город FROM ПунктыВыдачи WHERE Код=?', point_id).fetchone()
                 if not found:
                     abort(400)
-                city = found.City
+                city = found.Город
             if not 2 <= len(city) <= 80:
                 abort(400)
             if g.user:
-                db.cursor().execute('UPDATE Users SET SelectedPickupID=?, SelectedCity=? WHERE ID=?', point_id, city, g.user['ID'])
+                db.cursor().execute('UPDATE Пользователи SET ВыбранныйПунктВыдачи=?, ВыбранныйГород=? WHERE Код=?', point_id, city, g.user['Код'])
         session['selected_city'] = city
         session['selected_pickup_id'] = point_id
         flash('Адрес получения сохранён.' if point_id else 'Город изменён. Теперь выберите пункт выдачи.')
@@ -312,29 +383,30 @@ def register_routes(app, login_required, role_required):
         try:
             with connection() as db:
                 cur = db.cursor()
-                if not point_id or not cur.execute('SELECT ID FROM PickupPoints WHERE ID=?', point_id).fetchone():
+                point = cur.execute('SELECT Код, Город FROM ПунктыВыдачи WHERE Код=?', point_id).fetchone() if point_id else None
+                if not point:
                     flash('Выберите существующий пункт выдачи.')
                     return redirect(url_for('cart'))
-                items = cart_rows(db, g.user['ID'])
+                items = cart_rows(db, g.user['Код'])
                 if not items:
                     flash('Корзина пуста.')
                     return redirect(url_for('cart'))
-                total = sum(i['Quantity'] * i['Price'] for i in items)
-                cur.execute('''INSERT INTO OrderHeaders (UserID, PickupID, CreatedAt, OrderStatus, PickupCode, TotalAmount, CheckoutToken)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''', g.user['ID'], point_id, datetime.now(), 'created', f'{secrets.randbelow(1000000):06d}', total, token)
+                total = sum(i['Количество'] * i['Цена'] for i in items)
+                cur.execute('''INSERT INTO Заказы (КодПользователя, КодПунктаВыдачи, ДатаСоздания, СтатусЗаказа, КодПолучения, ОбщаяСумма, КлючОформления)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''', g.user['Код'], point_id, datetime.now(), 'shipping', f'{secrets.randbelow(1000000):06d}', total, token)
                 order_id = int(cur.execute('SELECT @@IDENTITY').fetchone()[0])
                 for item in items:
-                    if not item['IsActive']:
+                    if not item['Активен']:
                         raise StockError('Один из товаров больше не продаётся. Удалите его из корзины.')
                     # Условное обновление атомарно резервирует остаток: отрицательные значения невозможны.
-                    cur.execute('UPDATE ProductVariants SET Stock=Stock-? WHERE ID=? AND Stock>=?', item['Quantity'], item['VariantID'], item['Quantity'])
+                    cur.execute('UPDATE ВариантыТоваров SET Остаток=Остаток-? WHERE Код=? AND Остаток>=?', item['Количество'], item['КодВарианта'], item['Количество'])
                     if cur.rowcount != 1:
                         raise StockError('Остатки изменились. Обновите количество товаров в корзине.')
-                    cur.execute('''INSERT INTO OrderItems (OrderID, ProductID, ProductTitle, UnitPrice, Quantity, VariantID, OptionsText)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)''', order_id, item['ID'], item['Brand'] + ' / ' + item['Title'], item['Price'], item['Quantity'], item['VariantID'], item['SizeLabel'] + ' · ' + item['ColorLabel'])
-                event(cur, order_id, 'created')
-                cur.execute('DELETE FROM CartItems WHERE UserID=?', g.user['ID'])
-                cur.execute('UPDATE Users SET SelectedPickupID=? WHERE ID=?', point_id, g.user['ID'])
+                    cur.execute('''INSERT INTO СоставЗаказов (КодЗаказа, КодТовара, НазваниеТовара, ЦенаЗаЕдиницу, Количество, КодВарианта, Параметры)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)''', order_id, item['Код'], item['Бренд'] + ' / ' + item['Название'], item['Цена'], item['Количество'], item['КодВарианта'], item['Размер'] + ' · ' + item['Цвет'])
+                event(cur, order_id, 'shipping')
+                cur.execute('DELETE FROM Корзина WHERE КодПользователя=?', g.user['Код'])
+                cur.execute('UPDATE Пользователи SET ВыбранныйПунктВыдачи=?, ВыбранныйГород=? WHERE Код=?', point_id, point.Город, g.user['Код'])
         except StockError as error:
             flash(str(error))
             return redirect(url_for('cart'))
@@ -349,7 +421,7 @@ def register_routes(app, login_required, role_required):
     @login_required
     def orders():
         with connection() as db:
-            result = load_orders(db, 'o.UserID=?', [g.user['ID']])
+            result = load_orders(db, 'o.КодПользователя=?', [g.user['Код']])
         return render_template('orders.html', orders=result, staff_mode=False, status_filter='', search='')
 
     @app.post('/orders/<int:order_id>/cancel')
@@ -357,14 +429,24 @@ def register_routes(app, login_required, role_required):
     def cancel_order(order_id):
         with connection() as db:
             cur = db.cursor()
-            cur.execute("UPDATE OrderHeaders SET OrderStatus='cancelled' WHERE ID=? AND UserID=? AND OrderStatus='created'", order_id, g.user['ID'])
+            cur.execute("UPDATE Заказы SET СтатусЗаказа='cancelled' WHERE Код=? AND КодПользователя=? AND СтатусЗаказа IN ('created','shipping')", order_id, g.user['Код'])
             if cur.rowcount != 1:
                 abort(403)
-            for item in records(cur.execute('SELECT VariantID, Quantity FROM OrderItems WHERE OrderID=?', order_id)):
-                if item['VariantID']:
-                    cur.execute('UPDATE ProductVariants SET Stock=Stock+? WHERE ID=?', item['Quantity'], item['VariantID'])
+            restore_stock(cur, order_id)
             event(cur, order_id, 'cancelled')
         flash('Заказ отменён.')
+        return redirect(url_for('orders'))
+
+    @app.post('/orders/<int:order_id>/return')
+    @login_required
+    def request_return(order_id):
+        with connection() as db:
+            cur = db.cursor()
+            cur.execute("UPDATE Заказы SET СтатусЗаказа='return_requested' WHERE Код=? AND КодПользователя=? AND СтатусЗаказа='issued'", order_id, g.user['Код'])
+            if cur.rowcount != 1:
+                abort(403)
+            event(cur, order_id, 'return_requested')
+        flash('Возврат оформлен. Принеси все товары заказа в тот же ПВЗ и покажи код возврата.')
         return redirect(url_for('orders'))
 
     @app.post('/orders/<int:order_id>/repeat')
@@ -373,82 +455,128 @@ def register_routes(app, login_required, role_required):
         added = 0
         with connection() as db:
             cur = db.cursor()
-            if not cur.execute('SELECT ID FROM OrderHeaders WHERE ID=? AND UserID=?', order_id, g.user['ID']).fetchone():
+            if not cur.execute('SELECT Код FROM Заказы WHERE Код=? AND КодПользователя=?', order_id, g.user['Код']).fetchone():
                 abort(403)
-            items = records(cur.execute('SELECT * FROM OrderItems WHERE OrderID=?', order_id))
+            items = records(cur.execute('SELECT * FROM СоставЗаказов WHERE КодЗаказа=?', order_id))
             for item in items:
-                v = cur.execute('''SELECT v.ID, v.Stock FROM ProductVariants AS v INNER JOIN Products AS p ON v.ProductID=p.ID
-                    WHERE v.ID=? AND p.IsActive=True''', item['VariantID'] or 0).fetchone()
-                if not v or v.Stock <= 0:
+                v = cur.execute('''SELECT v.Код, v.Остаток FROM ВариантыТоваров AS v INNER JOIN Товары AS p ON v.КодТовара=p.Код
+                    WHERE v.Код=? AND p.Активен=True''', item['КодВарианта'] or 0).fetchone()
+                if not v or v.Остаток <= 0:
                     continue
-                row = cur.execute('SELECT ID, Quantity FROM CartItems WHERE UserID=? AND VariantID=?', g.user['ID'], v.ID).fetchone()
-                qty = min(99, v.Stock, item['Quantity'] + (row.Quantity if row else 0))
+                row = cur.execute('SELECT Код, Количество FROM Корзина WHERE КодПользователя=? AND КодВарианта=?', g.user['Код'], v.Код).fetchone()
+                qty = min(99, v.Остаток, item['Количество'] + (row.Количество if row else 0))
                 if row:
-                    cur.execute('UPDATE CartItems SET Quantity=? WHERE ID=?', qty, row.ID)
+                    cur.execute('UPDATE Корзина SET Количество=? WHERE Код=?', qty, row.Код)
                 else:
-                    cur.execute('INSERT INTO CartItems (UserID, ProductID, VariantID, Quantity) VALUES (?, ?, ?, ?)', g.user['ID'], item['ProductID'], v.ID, qty)
+                    cur.execute('INSERT INTO Корзина (КодПользователя, КодТовара, КодВарианта, Количество) VALUES (?, ?, ?, ?)', g.user['Код'], item['КодТовара'], v.Код, qty)
                 added += 1
         flash('Доступные товары добавлены в корзину по текущим ценам.' if added else 'Товары из этого заказа сейчас недоступны.')
         return redirect(url_for('cart'))
 
-    @app.get('/staff')
-    @role_required('admin', 'staff')
-    def staff():
+    def staff_page(found=None, lookup_code='', lookup_error='', issued_id=None):
         search = request.args.get('search', '').strip()[:20]
         status = request.args.get('status', '')
-        condition, params = ('1=1', []) if g.user['UserRole'] == 'admin' else ('o.PickupID=?', [g.user['PickupID'] or 0])
+        condition, params = ('1=1', []) if g.user['Роль'] == 'admin' else ('o.КодПунктаВыдачи=?', [g.user['КодПунктаВыдачи'] or 0])
         if search:
-            condition += ' AND o.ID=?'
+            condition += ' AND o.Код=?'
             params.append(int(search) if search.isdigit() and len(search) < 10 else 0)
         if status in STATUSES:
-            condition += ' AND o.OrderStatus=?'
+            condition += ' AND o.СтатусЗаказа=?'
             params.append(status)
         with connection() as db:
             result = load_orders(db, condition, params)
-        return render_template('orders.html', orders=result, staff_mode=True, status_filter=status, search=search)
+            issued = load_orders(db, "o.Код=? AND o.СтатусЗаказа IN ('issued','returned')" +
+                ('' if g.user['Роль'] == 'admin' else ' AND o.КодПунктаВыдачи=?'),
+                [issued_id] if g.user['Роль'] == 'admin' else [issued_id, g.user['КодПунктаВыдачи'] or 0]) if issued_id else []
+            found = found or []
+            product_ids = sorted({i['КодТовара'] for order in found for i in order['items']})
+            photos = {}
+            if product_ids:
+                products = enrich(db, records(db.cursor().execute('SELECT * FROM Товары WHERE Код IN (' +
+                    ','.join('?' for _ in product_ids) + ')', product_ids)))
+                photos = {p['Код']: p['images'][0] for p in products}
+            for order in found:
+                for item in order['items']:
+                    item['image'] = photos.get(item['КодТовара'])
+        return render_template('staff.html', orders=result, found=found, lookup_code=lookup_code,
+                               lookup_error=lookup_error, issued=issued[0] if issued else None,
+                               status_filter=status, search=search, lookup_mode=request.method == 'POST')
+
+    @app.get('/staff')
+    @role_required('admin', 'staff')
+    def staff():
+        return staff_page(issued_id=session.pop('pvz_issued_id', None))
+
+    @app.post('/staff/find')
+    @role_required('admin', 'staff')
+    def find_pickup_order():
+        code = request.form.get('code', '').strip()
+        if not re.fullmatch(r'[0-9]{6}', code):
+            return staff_page(lookup_code=code[:6], lookup_error='Введи шестизначный код покупателя.')
+        condition = "o.КодПолучения=? AND o.СтатусЗаказа IN ('ready','return_requested')"
+        params = [code]
+        if g.user['Роль'] != 'admin':
+            condition += ' AND o.КодПунктаВыдачи=?'
+            params.append(g.user['КодПунктаВыдачи'] or 0)
+        with connection() as db:
+            found = load_orders(db, condition, params)
+        return staff_page(found=found, lookup_code=code,
+                          lookup_error='' if found else 'Заказ не найден. Проверь код и убедись, что заказ поступил в твой ПВЗ.')
 
     @app.post('/staff/orders/<int:order_id>')
     @role_required('admin', 'staff')
     def process_order(order_id):
         with connection() as db:
             cur = db.cursor()
-            rows = records(cur.execute('SELECT * FROM OrderHeaders WHERE ID=?', order_id))
+            rows = records(cur.execute('SELECT * FROM Заказы WHERE Код=?', order_id))
             if not rows:
                 abort(404)
             order = rows[0]
-            if g.user['UserRole'] != 'admin' and order['PickupID'] != g.user['PickupID']:
+            if g.user['Роль'] != 'admin' and order['КодПунктаВыдачи'] != g.user['КодПунктаВыдачи']:
                 abort(403)
             action = request.form.get('action')
             new_status = None
-            if action == 'shipping' and order['OrderStatus'] == 'created' and g.user['UserRole'] == 'admin':
+            if action == 'shipping' and order['СтатусЗаказа'] == 'created' and g.user['Роль'] == 'admin':
                 new_status = 'shipping'
-            elif action == 'ready' and order['OrderStatus'] in {'created', 'shipping'}:
+            elif action == 'ready' and order['СтатусЗаказа'] in {'created', 'shipping'}:
                 new_status = 'ready'
-            elif action == 'issue' and order['OrderStatus'] == 'ready':
-                if hmac.compare_digest(order['PickupCode'], request.form.get('code', '').strip()):
+            elif action == 'issue' and order['СтатусЗаказа'] == 'ready':
+                if hmac.compare_digest(order['КодПолучения'], request.form.get('code', '').strip()):
                     new_status = 'issued'
                 else:
                     flash('Код получения неверный. Заказ не выдан.')
                     return redirect(url_for('staff'))
+            elif action in {'return', 'refuse'} and order['СтатусЗаказа'] == ('return_requested' if action == 'return' else 'ready'):
+                if not hmac.compare_digest(order['КодПолучения'], request.form.get('code', '').strip()):
+                    flash('Код неверный. Возврат не принят.')
+                    return redirect(url_for('staff'))
+                new_status = 'returned'
             if not new_status:
                 flash('Это действие недоступно для текущего статуса заказа.')
             else:
-                cur.execute('UPDATE OrderHeaders SET OrderStatus=? WHERE ID=? AND OrderStatus=?', new_status, order_id, order['OrderStatus'])
+                cur.execute('UPDATE Заказы SET СтатусЗаказа=? WHERE Код=? AND СтатусЗаказа=?', new_status, order_id, order['СтатусЗаказа'])
                 if cur.rowcount == 1:
+                    if new_status == 'returned':
+                        restore_stock(cur, order_id)
                     event(cur, order_id, new_status)
-                flash('Статус заказа обновлён.')
+                    if new_status in {'issued', 'returned'} and request.form.get('desk') == '1':
+                        session['pvz_issued_id'] = order_id
+                if not (new_status in {'issued', 'returned'} and request.form.get('desk') == '1'):
+                    flash('Статус заказа обновлён.')
         return redirect(url_for('staff'))
 
     @app.get('/admin')
     @role_required('admin')
     def admin():
+        section = request.args.get('section', 'products')
+        if section not in {'products', 'points', 'users', 'suppliers'}:
+            section = 'products'
         with connection() as db:
-            users = records(db.cursor().execute('SELECT ID, DisplayName, Email, UserRole, PickupID FROM Users ORDER BY ID'))
-            points = records(db.cursor().execute('SELECT * FROM PickupPoints ORDER BY ID'))
+            users = records(db.cursor().execute('SELECT Код, Имя, ЭлектроннаяПочта, Роль, КодПунктаВыдачи, ЗаявкаПоставщика, НазваниеКомпании FROM Пользователи ORDER BY Код')) if section in {'users', 'suppliers'} else []
+            points = records(db.cursor().execute('SELECT * FROM ПунктыВыдачи ORDER BY Город, Адрес')) if section in {'users', 'points'} else []
             cats = categories(db)
-            products = enrich(db, records(db.cursor().execute('SELECT * FROM Products ORDER BY ID DESC')))
-            stats = {name: db.cursor().execute(f'SELECT COUNT(*) FROM [{table}]').fetchone()[0] for name, table in [('users', 'Users'), ('orders', 'OrderHeaders'), ('points', 'PickupPoints')]}
-        return render_template('admin.html', users=users, points=points, categories=cats, products=products, stats=stats)
+            products = enrich(db, records(db.cursor().execute('SELECT * FROM Товары ORDER BY Код DESC'))) if section == 'products' else []
+        return render_template('admin.html', section=section, users=users, points=points, categories=cats, products=products)
 
     @app.post('/admin/pickup')
     @role_required('admin')
@@ -458,9 +586,9 @@ def register_routes(app, login_required, role_required):
             flash('Заполните город, адрес и часы работы пункта.')
         else:
             with connection() as db:
-                db.cursor().execute('INSERT INTO PickupPoints (City, Address, Hours) VALUES (?, ?, ?)', city, address, hours)
+                db.cursor().execute('INSERT INTO ПунктыВыдачи (Город, Адрес, ЧасыРаботы) VALUES (?, ?, ?)', city, address, hours)
             flash('Пункт выдачи создан.')
-        return redirect(url_for('admin') + '#points')
+        return redirect(url_for('admin', section='points'))
 
     @app.post('/admin/users/<int:user_id>')
     @role_required('admin')
@@ -471,17 +599,53 @@ def register_routes(app, login_required, role_required):
             abort(400)
         with connection() as db:
             cur = db.cursor()
-            target = cur.execute('SELECT UserRole FROM Users WHERE ID=?', user_id).fetchone()
+            target = cur.execute('SELECT Роль FROM Пользователи WHERE Код=?', user_id).fetchone()
             if not target:
                 abort(404)
-            if role == 'staff' and (not point_id or not cur.execute('SELECT ID FROM PickupPoints WHERE ID=?', point_id).fetchone()):
+            if role == 'staff' and (not point_id or not cur.execute('SELECT Код FROM ПунктыВыдачи WHERE Код=?', point_id).fetchone()):
                 flash('Для сотрудника выберите пункт выдачи.')
-            elif target.UserRole == 'admin' and role != 'admin' and cur.execute("SELECT COUNT(*) FROM Users WHERE UserRole='admin'").fetchone()[0] <= 1:
+            elif target.Роль == 'admin' and role != 'admin' and cur.execute("SELECT COUNT(*) FROM Пользователи WHERE Роль='admin'").fetchone()[0] <= 1:
                 flash('Нельзя убрать права у последнего администратора.')
             else:
-                cur.execute('UPDATE Users SET UserRole=?, PickupID=? WHERE ID=?', role, point_id, user_id)
+                cur.execute('UPDATE Пользователи SET Роль=?, КодПунктаВыдачи=? WHERE Код=?', role, point_id, user_id)
                 flash('Права пользователя обновлены.')
-        return redirect(url_for('admin') + '#users')
+        return redirect(url_for('admin', section='users'))
+
+    @app.post('/supplier/apply')
+    @role_required('customer')
+    def apply_supplier():
+        company = request.form.get('company', '').strip()
+        if not 2 <= len(company) <= 100:
+            flash('Укажите название магазина от 2 до 100 символов.')
+        else:
+            with connection() as db:
+                db.cursor().execute("UPDATE Пользователи SET НазваниеКомпании=?, ЗаявкаПоставщика='pending' WHERE Код=?", company, g.user['Код'])
+            flash('Заявка отправлена администратору.')
+        return redirect(url_for('account'))
+
+    @app.post('/admin/suppliers/<int:user_id>')
+    @role_required('admin')
+    def review_supplier(user_id):
+        action = request.form.get('action')
+        if action not in {'approve', 'reject'}:
+            abort(400)
+        with connection() as db:
+            cur = db.cursor()
+            target = cur.execute('SELECT Роль, ЗаявкаПоставщика FROM Пользователи WHERE Код=?', user_id).fetchone()
+            if not target or target.Роль != 'customer' or target.ЗаявкаПоставщика != 'pending':
+                abort(409)
+            cur.execute('UPDATE Пользователи SET Роль=?, ЗаявкаПоставщика=? WHERE Код=?',
+                        'supplier' if action == 'approve' else 'customer', 'approved' if action == 'approve' else 'rejected', user_id)
+        flash('Поставщик добавлен.' if action == 'approve' else 'Заявка отклонена.')
+        return redirect(url_for('admin', section='suppliers'))
+
+    @app.get('/supplier')
+    @role_required('supplier')
+    def supplier():
+        with connection() as db:
+            products = enrich(db, records(db.cursor().execute('SELECT * FROM Товары WHERE КодПоставщика=? ORDER BY Код DESC', g.user['Код'])))
+            cats = categories(db)
+        return render_template('supplier.html', products=products, categories=cats)
 
     @app.post('/admin/categories')
     @role_required('admin')
@@ -492,28 +656,30 @@ def register_routes(app, login_required, role_required):
             flash('Название категории должно содержать от 2 до 80 символов.')
         else:
             with connection() as db:
-                if parent and not db.cursor().execute('SELECT ID FROM Categories WHERE ID=? AND ParentID IS NULL', parent).fetchone():
+                if parent and not db.cursor().execute('SELECT Код FROM Категории WHERE Код=? AND КодРодителя IS NULL', parent).fetchone():
                     abort(400)
-                db.cursor().execute('INSERT INTO Categories (Title, ParentID) VALUES (?, ?)', title, parent)
+                db.cursor().execute('INSERT INTO Категории (Название, КодРодителя) VALUES (?, ?)', title, parent)
             flash('Категория добавлена.')
-        return redirect(url_for('admin') + '#categories')
+        return redirect(url_for('admin'))
 
     @app.route('/admin/products/new', methods=['GET', 'POST'])
     @app.route('/admin/products/<int:product_id>/edit', methods=['GET', 'POST'])
-    @role_required('admin')
+    @role_required('admin', 'supplier')
     def edit_product(product_id=None):
         with connection() as db:
             cats = categories(db)
-            old = records(db.cursor().execute('SELECT * FROM Products WHERE ID=?', product_id)) if product_id else []
+            old = records(db.cursor().execute('SELECT * FROM Товары WHERE Код=?', product_id)) if product_id else []
             if product_id and not old:
                 abort(404)
+            if old and g.user['Роль'] == 'supplier' and old[0]['КодПоставщика'] != g.user['Код']:
+                abort(403)
             p = enrich(db, old)[0] if old else None
         if request.method == 'GET':
             return render_template('edit_product.html', p=p, categories=cats)
         try:
             title, brand = request.form.get('title', '').strip(), request.form.get('brand', '').strip()
             category_id = request.form.get('category_id', type=int)
-            if not 2 <= len(title) <= 150 or not 1 <= len(brand) <= 80 or category_id not in {c['ID'] for c in cats}:
+            if not 2 <= len(title) <= 150 or not 1 <= len(brand) <= 80 or category_id not in {c['Код'] for c in cats}:
                 raise ValueError('Проверьте название, бренд и категорию.')
             try:
                 price = Decimal(request.form.get('price', '').replace(',', '.'))
@@ -542,45 +708,49 @@ def register_routes(app, login_required, role_required):
             with connection() as db:
                 cur = db.cursor()
                 if product_id:
-                    cur.execute('UPDATE Products SET CategoryID=?, Brand=?, Title=?, Price=?, OldPrice=?, Description=?, Specifications=?, IsActive=? WHERE ID=?',
+                    cur.execute('UPDATE Товары SET КодКатегории=?, Бренд=?, Название=?, Цена=?, СтараяЦена=?, Описание=?, Характеристики=?, Активен=? WHERE Код=?',
                                 category_id, brand, title, price, old_price, description, specifications, active, product_id)
                 else:
-                    cur.execute('''INSERT INTO Products (CategoryID, Brand, Title, Price, OldPrice, Rating, Reviews, Picture, Tint, Description, Specifications, IsActive)
+                    cur.execute('''INSERT INTO Товары (КодКатегории, Бренд, Название, Цена, СтараяЦена, Рейтинг, КоличествоОтзывов, Изображение, Оттенок, Описание, Характеристики, Активен)
                         VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)''', category_id, brand, title, price, old_price, 'shirt', '#f4f3f6', description, specifications, active)
                     product_id = int(cur.execute('SELECT @@IDENTITY').fetchone()[0])
-                current_ids = {r.ID for r in cur.execute('SELECT ID FROM ProductVariants WHERE ProductID=?', product_id)}
+                    if g.user['Роль'] == 'supplier':
+                        cur.execute('UPDATE Товары SET КодПоставщика=? WHERE Код=?', g.user['Код'], product_id)
+                current_ids = {r.Код for r in cur.execute('SELECT Код FROM ВариантыТоваров WHERE КодТовара=?', product_id)}
                 for vid, size, color, stock in variants:
                     if vid and vid not in current_ids:
                         raise ValueError('Вариант товара не принадлежит этой карточке.')
                     if vid:
-                        cur.execute('UPDATE ProductVariants SET SizeLabel=?, ColorLabel=?, Stock=? WHERE ID=?', size, color, stock, vid)
+                        cur.execute('UPDATE ВариантыТоваров SET Размер=?, Цвет=?, Остаток=? WHERE Код=?', size, color, stock, vid)
                     else:
-                        cur.execute('INSERT INTO ProductVariants (ProductID, SizeLabel, ColorLabel, Stock) VALUES (?, ?, ?, ?)', product_id, size, color, stock)
+                        cur.execute('INSERT INTO ВариантыТоваров (КодТовара, Размер, Цвет, Остаток) VALUES (?, ?, ?, ?)', product_id, size, color, stock)
                 # Существующие варианты не удаляются: исторические заказы сохраняют свои связи.
                 for missing_id in current_ids - {v[0] for v in variants if v[0]}:
-                    cur.execute('UPDATE ProductVariants SET Stock=0 WHERE ID=?', missing_id)
+                    cur.execute('UPDATE ВариантыТоваров SET Остаток=0 WHERE Код=?', missing_id)
                 if images and request.form.get('replace_photos') == 'on':
-                    cur.execute('DELETE FROM ProductImages WHERE ProductID=?', product_id)
-                maximum = cur.execute('SELECT MAX(SortOrder) FROM ProductImages WHERE ProductID=?', product_id).fetchone()[0] or 0
+                    cur.execute('DELETE FROM ФотографииТоваров WHERE КодТовара=?', product_id)
+                maximum = cur.execute('SELECT MAX(Порядок) FROM ФотографииТоваров WHERE КодТовара=?', product_id).fetchone()[0] or 0
                 for number, image in enumerate(images, maximum + 1):
-                    cur.execute('INSERT INTO ProductImages (ProductID, ImagePath, SortOrder) VALUES (?, ?, ?)', product_id, image, number)
+                    cur.execute('INSERT INTO ФотографииТоваров (КодТовара, ПутьКФото, Порядок) VALUES (?, ?, ?)', product_id, image, number)
             flash('Карточка товара сохранена.')
-            return redirect(url_for('admin') + '#products')
+            return redirect(url_for('supplier') if g.user['Роль'] == 'supplier' else url_for('admin'))
         except ValueError as error:
             flash(str(error))
             return render_template('edit_product.html', p=p, categories=cats), 400
 
     @app.post('/admin/products/<int:product_id>/visibility')
-    @role_required('admin')
+    @role_required('admin', 'supplier')
     def product_visibility(product_id):
         with connection() as db:
             cur = db.cursor()
-            row = cur.execute('SELECT IsActive FROM Products WHERE ID=?', product_id).fetchone()
+            row = cur.execute('SELECT Активен, КодПоставщика FROM Товары WHERE Код=?', product_id).fetchone()
             if not row:
                 abort(404)
-            cur.execute('UPDATE Products SET IsActive=? WHERE ID=?', not row.IsActive, product_id)
+            if g.user['Роль'] == 'supplier' and row.КодПоставщика != g.user['Код']:
+                abort(403)
+            cur.execute('UPDATE Товары SET Активен=? WHERE Код=?', not row.Активен, product_id)
         flash('Видимость товара изменена. История заказов сохранена.')
-        return redirect(url_for('admin') + '#products')
+        return redirect(url_for('supplier') if g.user['Роль'] == 'supplier' else url_for('admin'))
 
     @app.errorhandler(403)
     def forbidden(error):

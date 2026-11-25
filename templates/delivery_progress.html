@@ -1,0 +1,26 @@
+<div class="delivery-animation" data-delivery-state="{{ order.СтатусЗаказа }}" data-delivery-elapsed="{{ order.delivery_elapsed|round(1) }}" style="--delivery-progress: {{ 100 if order.СтатусЗаказа in ['ready','issued'] else order.delivery_progress }}%" role="group" aria-label="Доставка заказа №{{ order.Код }}">
+  <div class="delivery-road" aria-hidden="true">
+    <div class="delivery-lane"><div class="delivery-rail"><div class="delivery-fill"></div></div>
+    <div class="delivery-truck">
+      <svg viewBox="0 0 90 58" xmlns="http://www.w3.org/2000/svg" fill="none">
+        <ellipse cx="43" cy="53" rx="37" ry="3" fill="currentColor" opacity=".09"/>
+        <g class="truck-body">
+          <rect x="7" y="7" width="46" height="33" rx="5" fill="currentColor"/>
+          <path d="M53 19h17c3 0 5 2 7 5l8 13v7H53V19Z" fill="currentColor" opacity=".7"/>
+          <path d="M60 23h10l7 12H60V23Z" fill="#fff" opacity=".85"/>
+          <path d="M4 40h80v5H4z" fill="currentColor"/>
+          <path d="M16 17h18M16 23h12" stroke="#fff" stroke-width="2" stroke-linecap="round" opacity=".55"/>
+          <rect x="80" y="36" width="5" height="4" rx="1" fill="#f3d59b"/>
+        </g>
+        <g class="truck-wheel"><circle cx="23" cy="45" r="8" fill="#35213e"/><circle cx="23" cy="45" r="4" fill="#fff"/><path d="M23 42v6M20 45h6" stroke="#af84bf" stroke-width="1.5"/></g>
+        <g class="truck-wheel"><circle cx="69" cy="45" r="8" fill="#35213e"/><circle cx="69" cy="45" r="4" fill="#fff"/><path d="M69 42v6M66 45h6" stroke="#af84bf" stroke-width="1.5"/></g>
+      </svg>
+    </div>
+    <span class="delivery-destination">{{ icon('pin') }}</span>
+    </div><div class="delivery-road-label"><span>В пути</span><span>Пункт выдачи</span></div>
+  </div>
+  <div class="delivery-success" aria-hidden="{{ 'false' if order.СтатусЗаказа in ['ready','issued'] else 'true' }}">
+    <div class="delivery-check"><svg viewBox="0 0 52 52" fill="none" aria-hidden="true"><circle class="delivery-check-ring" cx="26" cy="26" r="23"/><path class="delivery-check-mark" d="m15 26 8 8 15-16"/></svg></div>
+    <div><strong data-delivery-message>{{ 'Заказ получен' if order.СтатусЗаказа == 'issued' else 'Ваш заказ доставлен' }}</strong><p>{{ 'Спасибо за покупку!' if order.СтатусЗаказа == 'issued' else 'Можно забирать в пункте выдачи' }}</p></div>
+  </div>
+</div>

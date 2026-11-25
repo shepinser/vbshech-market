@@ -1,0 +1,7 @@
+
+<dialog id="management-dialog" class="modal management-modal" aria-labelledby="management-title">
+  <div class="modal-heading"><h2 id="management-title">Новый товар</h2><button type="button" class="icon-button" data-close aria-label="Закрыть окно">×</button></div>
+  <p class="dialog-error" role="alert" hidden></p><div data-dialog-content></div>
+</dialog>
+<template id="new-product-fields">{% with p=none %}{% include 'product_fields.html' %}{% endwith %}</template>
+<script defer src="{{ url_for('static', filename='management.js', v=9) }}"></script>

@@ -13,17 +13,17 @@ def create_admin():
         raise SystemExit('Invalid email')
     with connection() as db:
         cur = db.cursor()
-        if cur.execute("SELECT ID FROM Users WHERE UserRole='admin'").fetchone():
+        if cur.execute("SELECT Код FROM Пользователи WHERE Роль='admin'").fetchone():
             raise SystemExit('Admin already exists. Assign roles through the admin panel.')
-        if cur.execute('SELECT ID FROM Users WHERE Email=?', email).fetchone():
-            cur.execute("UPDATE Users SET UserRole='admin', PickupID=NULL WHERE Email=?", email)
+        if cur.execute('SELECT Код FROM Пользователи WHERE ЭлектроннаяПочта=?', email).fetchone():
+            cur.execute("UPDATE Пользователи SET Роль='admin', КодПунктаВыдачи=NULL WHERE ЭлектроннаяПочта=?", email)
         else:
             password = getpass.getpass('Password (8-128 characters): ')
             if not 8 <= len(password) <= 128:
                 raise SystemExit('Invalid password length')
             if password != getpass.getpass('Repeat password: '):
                 raise SystemExit('Passwords do not match')
-            cur.execute('INSERT INTO Users (DisplayName, Email, PasswordHash, CreatedAt, UserRole) VALUES (?, ?, ?, ?, ?)',
+            cur.execute('INSERT INTO Пользователи (Имя, ЭлектроннаяПочта, ХешПароля, ДатаСоздания, Роль) VALUES (?, ?, ?, ?, ?)',
                         'Администратор', email, generate_password_hash(password), datetime.now(), 'admin')
     print('Admin account is ready. Sign in through the regular login page.')
 
